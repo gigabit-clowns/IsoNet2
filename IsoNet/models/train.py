@@ -76,6 +76,27 @@ def apply_F_filter_torch(input_map,F_map):
     out = torch.fft.ifftn(torch.fft.fftshift(fft_input*F_map, dim=(-1, -2, -3)),dim=(-1, -2, -3))
     out =  torch.real(out)
     return out
+class _Passes:
+    """Passes over a dataset that says how it is read (rows) and what a batch of it is
+    (make_batch), each through vitrio.data, the next batches read on its threads into
+    pinned memory and copied to `device` while the current one is trained on."""
+
+    def __init__(self, dataset, batch_sampler, device):
+        self.dataset = dataset
+        self.batch_sampler = batch_sampler
+        self.device = device
+
+    def __len__(self):
+        return len(self.batch_sampler)
+
+    def __iter__(self):
+        import vitrio as vio
+        yield from vio.data.DataLoader(
+            self.dataset.rows(), batch_sampler=self.batch_sampler, output="torch",
+            device=self.device, transform=self.dataset.make_batch,
+        )
+
+
 def process_batch(batch):
     if len(batch) == 7:
         return [b.cuda() for b in batch]
@@ -86,7 +107,6 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
     os.environ["MASTER_PORT"] = port_number
     batch_size_gpu = training_params['batch_size'] // (training_params['acc_batches'] * world_size)
        
-    n_workers = max(training_params["ncpus"] // world_size, 1)
 
     if world_size > 1:
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
@@ -95,15 +115,17 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
         model = model.to(rank)
         model = DDP(model, device_ids=[rank])
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size_gpu, persistent_workers=True,
-            num_workers=n_workers, pin_memory=True, sampler=train_sampler)
+        sampler = train_sampler
     else:
         model = model.to(rank)
         train_sampler = None
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size_gpu, persistent_workers=True,
-            num_workers=n_workers, pin_memory=True, sampler=train_sampler, shuffle=True)
+        sampler = torch.utils.data.RandomSampler(train_dataset)
+    # The batches PyTorch's DataLoader drew, read through vitrio with no worker process.
+    train_loader = _Passes(
+        train_dataset,
+        torch.utils.data.BatchSampler(sampler, batch_size_gpu, drop_last=False),
+        torch.device("cuda", rank),
+    )
 
     if training_params['compile_model'] == True:
         if torch.__version__ >= "2.0.0":

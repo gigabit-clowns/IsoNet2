@@ -83,6 +83,18 @@ class Train_sets_regular(Dataset):
     def __len__(self):
         return len(self.path_all)
 
+    def rows(self):
+        """The pairs of a pass as rows vitrio reads: a whole file of each pair each."""
+        import vitrio as vio
+        x, y = zip(*self.path_all)
+        return vio.data.Dataset(
+            {"x": vio.data.ImageSource(list(x)), "y": vio.data.ImageSource(list(y))}, index=None
+        )
+
+    def make_batch(self, batch):
+        """A batch of pairs, as __getitem__ makes them, wherever the batch is."""
+        return [batch["x"][:, None], batch["y"][:, None]]
+
 
 
 class Train_sets_n2n(Dataset):
@@ -286,6 +298,78 @@ class Train_sets_n2n(Dataset):
 
     def __len__(self):
         return self.length
+
+    def rows(self):
+        """The subvolumes of a pass as rows vitrio reads: the crops of the halves, and
+        of the ground truth, around the centres, the tomogram each is of, and the
+        noise volume each is given, drawn anew each pass as __getitem__ draws it."""
+        import vitrio as vio
+        tomos = np.repeat(np.arange(self.n_tomos), [len(c) for c in self.coords])
+        centres = np.concatenate(self.coords)
+        crop = (self.cube_size,) * 3
+
+        def crops(paths):
+            return vio.data.PatchSource(
+                [paths[t] for t in tomos], centres, crop, data_type="float32", check=False
+            )
+
+        fields = {
+            "even": crops(self.tomo_paths_even),
+            "odd": crops(self.tomo_paths_odd),
+            "tomo": tomos,
+        }
+        if self.has_groundtruth:
+            fields["gt"] = crops(self.tomo_paths_gt)
+        if self.noise_dir != None:
+            fields["noise"] = vio.data.ImageSource(
+                [random.choice(self.noise_files) for _ in tomos], data_type="float32"
+            )
+        return vio.data.Dataset(fields, index=None)
+
+    def _per_tomogram(self, device):
+        """What each tomogram gives its subvolumes, on `device`, made once there."""
+        made = self.__dict__.setdefault("_on_device", {})
+        if device not in made:
+            def stack(values):
+                return torch.from_numpy(np.stack([np.asarray(v) for v in values])).to(device)
+            made[device] = {
+                "mean": stack(self.mean), "std": stack(self.std), "mw": stack(self.mw_list),
+                "CTF": stack(self.CTF_list), "wiener": stack(self.wiener_list),
+            }
+        return made[device]
+
+    def make_batch(self, batch):
+        """A batch of subvolumes, as __getitem__ makes them, out of their rows, on the
+        device the rows are on: normalized, randomly swapped, with what their tomogram
+        gives them and their noise volume shuffled along y."""
+        t = batch["tomo"]
+        n = len(t)
+        known = self._per_tomogram(batch["even"].device)
+
+        def normalized(volumes, eo_idx):
+            mean = known["mean"][t, eo_idx][:, None, None, None]
+            std = known["std"][t, eo_idx][:, None, None, None]
+            return (mean - volumes) / std
+
+        even, odd = normalized(batch["even"], 0), normalized(batch["odd"], 1)
+        swap = torch.from_numpy(np.random.rand(n) > 0.5).to(even.device)[:, None, None, None]
+        x1, x2 = torch.where(swap, odd, even), torch.where(swap, even, odd)
+
+        if self.has_groundtruth:
+            gt = normalized(batch["gt"], 1)[:, None]
+        else:
+            gt = torch.zeros((n, 1), dtype=torch.float32, device=even.device)
+
+        if "noise" in batch:
+            noise = batch["noise"]
+            order = torch.from_numpy(np.argsort(np.random.rand(n, noise.shape[2]), axis=1))
+            order = order.to(noise.device)[:, None, :, None].expand_as(noise)
+            noise = torch.gather(noise, 2, order)[:, None]
+        else:
+            noise = torch.zeros((n, 1, 1), dtype=torch.float32, device=even.device)
+
+        return [x1[:, None], x2[:, None], gt, known["mw"][t][:, None],
+                known["CTF"][t][:, None], known["wiener"][t][:, None], noise]
 
     def __getitem__(self, idx):
         """Return a sample of data at a given index."""
