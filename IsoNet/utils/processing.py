@@ -18,6 +18,31 @@ def normalize(x, percentile = True, pmin=5.0, pmax=95.0, axis=None, clip=False, 
         out = out.astype(np.float32)
         return out
 
+def tomogram_normalization(path, method, pmin=5.0, pmax=95.0, eps=1e-20):
+    """What normalizes the tomogram in the file at `path` for prediction, as a function
+    of any of its voxels: the same values as normalizing the inverted tomogram whole.
+
+    The isonet2 method takes percentiles of the whole tomogram, so it is read whole
+    once; the others take the mean and deviation of its central 60 sections alone.
+    """
+    from IsoNet.utils.fileio import read_mrc
+
+    if method == 'isonet2':
+        inverted = read_mrc(path)[0] * -1
+        mi = np.percentile(inverted, pmin, axis=None, keepdims=True)
+        ma = np.percentile(inverted, pmax, axis=None, keepdims=True)
+        del inverted
+        scale = ma - mi + eps
+        return lambda voxels: ((voxels * -1 - mi) / scale).astype(np.float32)
+
+    tomo, _ = read_mrc(path, inplace=True)
+    Z = tomo.shape[0]
+    central = tomo[Z//2-30:Z//2+30] * -1
+    mean, std = np.mean(central), np.std(central)
+    del central, tomo
+    return lambda voxels: (voxels * -1 - mean) / std
+
+
 def crop_to_size(array, crop_size, cube_size):
         start = crop_size//2 - cube_size//2
         end = crop_size//2 + cube_size//2

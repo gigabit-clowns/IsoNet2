@@ -20,7 +20,7 @@ import logging
 import numpy as np
 import starfile
 from IsoNet.models.network import Net
-from IsoNet.utils.processing import normalize
+from IsoNet.utils.processing import normalize, tomogram_normalization
 from IsoNet.utils.missing_wedge import mw3D
 from IsoNet.utils.CTF import get_ctf_3d
 import shutil
@@ -447,22 +447,16 @@ class ISONET:
             
             out_data = []
             for tomo_p in tomo_paths:
-                tomo_vol, _ = read_mrc(tomo_p)
-                # now we are using precentile again similar to isonet1
-                if network.method =='isonet2':
-                    tomo_vol = normalize(tomo_vol * -1, percentile=True)
-                else:
-                    Z = tomo_vol.shape[0]
-                    tomo_vol = tomo_vol*-1
-                    mean = np.mean(tomo_vol[Z//2-30:Z//2+30])
-                    std = np.std(tomo_vol[Z//2-30:Z//2+30])
-                    tomo_vol = (tomo_vol-mean)/std#normalize(tomo_vol * -1, percentile=False)
+                # The tomogram is read whole for what normalizes it, and then a tile at
+                # a time, each normalized as the whole would have been.
+                prepare = tomogram_normalization(tomo_p, network.method)
                 out_data.append(network.predict_map(
-                    tomo_vol, output_dir,
+                    tomo_p, output_dir,
                     cube_size= int(cube_size / padding_factor+0.1),
                     crop_size=cube_size,
                     F_mask=F_mask,
-                    idx=i + 1
+                    idx=i + 1,
+                    prepare=prepare,
                 ))
 
             out_data = sum(out_data) / len(out_data)

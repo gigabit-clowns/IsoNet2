@@ -143,3 +143,107 @@ class reform3D:
 
 if __name__ == '__main__':
     pass
+
+
+class FileTiles:
+    """The tiles of a tomogram as reform3D cuts them, read from its file a few at a
+    time rather than all at once out of a padded copy of it, and blended back as
+    reform3D.restore blends them.
+
+    reform3D pads the tomogram symmetrically and cuts crops of `cropsize` every
+    `cubesize`. Every value of such a crop is a voxel of the tomogram, so each crop is
+    read as a window of `cropsize` inside it, and the crops that reach into the padding
+    gather their voxels from that window by the index the padding reflects them to.
+    """
+
+    def __init__(self, path, cubesize, cropsize, edge_depth):
+        import vitrio as vio
+
+        self.path = path
+        self.cubesize = cubesize
+        self.cropsize = cropsize
+        self.edge_depth = edge_depth
+        self.shape = np.array(vio.query_descriptor(path).extents, dtype=int)
+        if self.shape.size != 3 or np.any(self.shape < cropsize):
+            raise ValueError(
+                f"{path} is of shape {tuple(self.shape)}, and its tiles are crops of "
+                f"{cropsize} along each axis."
+            )
+        # reform3D's geometry, over a volume of this shape that holds nothing.
+        self._reform = reform3D(
+            np.broadcast_to(np.float32(0), tuple(self.shape)), cubesize, cropsize, edge_depth
+        )
+        self._sidelen = self._reform._sidelen
+        self._pad_left = int((cropsize - cubesize) / 2 + edge_depth)
+
+        # Per axis: the window each crop is read from, and the index within it of each
+        # voxel of the crop, through the symmetric padding.
+        self._windows, self._gathers = [], []
+        for n, count in zip(self.shape, self._sidelen):
+            starts = np.arange(count) * cubesize - self._pad_left
+            sources = starts[:, None] + np.arange(cropsize)
+            sources = np.where(sources < 0, -sources - 1, sources)
+            sources = np.where(sources >= n, 2 * n - sources - 1, sources)
+            windows = np.clip(sources.min(axis=1), 0, n - cropsize)
+            self._windows.append(windows)
+            self._gathers.append(sources - windows[:, None])
+        self._masks = self._reform.mask(*(cubesize + edge_depth * 2,) * 3)
+
+    def __len__(self):
+        return int(np.prod(self._sidelen))
+
+    def _grid(self):
+        return np.unravel_index(np.arange(len(self)), tuple(self._sidelen))
+
+    def dataset(self, data_type=None):
+        """The tiles as rows of vitrio.data, in the order reform3D cuts them."""
+        import vitrio as vio
+
+        grid = self._grid()
+        centres = np.stack(
+            [windows[i] + self.cropsize // 2 for windows, i in zip(self._windows, grid)], axis=1
+        )
+        return vio.data.Dataset({
+            "window": vio.data.PatchSource(
+                [self.path] * len(self), centres, (self.cropsize,) * 3,
+                data_type=data_type, check=False,
+            ),
+            **{axis: gather[i] for axis, gather, i in zip("zyx", self._gathers, grid)},
+        })
+
+    def crops(self, batch):
+        """The crops of a batch of rows of `dataset`, padding included."""
+        rows = np.arange(len(batch["window"]))[:, None, None, None]
+        z = batch["z"][:, :, None, None]
+        y = batch["y"][:, None, :, None]
+        x = batch["x"][:, None, None, :]
+        return batch["window"][rows, z, y, x]
+
+    def blender(self):
+        """Where predicted cubes are blended back, as reform3D.restore blends them."""
+        return _Blender(self)
+
+
+class _Blender:
+    def __init__(self, tiles):
+        self.tiles = tiles
+        self.restored = np.zeros(
+            tuple(tiles._sidelen * tiles.cubesize + tiles.edge_depth * 2), dtype=np.float32
+        )
+        self.added = 0
+
+    def add(self, tile, cube):
+        """Add the cropped prediction of tile number `tile` where it lies."""
+        c, e = self.tiles.cubesize, self.tiles.edge_depth
+        i, j, k = np.unravel_index(tile, tuple(self.tiles._sidelen))
+        self.restored[i*c:(i+1)*c+e*2, j*c:(j+1)*c+e*2, k*c:(k+1)*c+e*2] += cube * self.tiles._masks
+        self.added += 1
+
+    def result(self):
+        if self.added != len(self.tiles):
+            raise RuntimeError(
+                f"{self.added} of the {len(self.tiles)} tiles of {self.tiles.path} were blended."
+            )
+        p = self.tiles.edge_depth * 2
+        sp = self.tiles.shape
+        return self.restored[p:p+sp[0], p:p+sp[1], p:p+sp[2]]

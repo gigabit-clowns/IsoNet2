@@ -2,11 +2,11 @@ import numpy as np
 import torch
 import os
 import logging
-from IsoNet.utils.toTile import reform3D
+from IsoNet.utils.toTile import FileTiles
 import socket
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from IsoNet.models.train import ddp_train, ddp_predict
+from IsoNet.models.train import ddp_train, ddp_predict, predict_tiles
 
 def find_unused_port():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -251,18 +251,17 @@ class Net:
         return outData
 
     
-    def predict_map(self, data, output_dir, cube_size = 64, crop_size=96, F_mask=None, idx=None):
+    def predict_map(self, path, output_dir, cube_size = 64, crop_size=96, F_mask=None, idx=None, prepare=None):
+        """Predict the tomogram in the file at `path`, a tile at a time, never holding
+        more of it than the tiles under way and the map they are blended into.
+        `prepare` makes the input of the network out of the voxels of a batch of crops,
+        elementwise, as the tomogram is normalized."""
         # change edge width from 7 to 5 to reduce computing
-        reform_ins = reform3D(data,cube_size,crop_size,5)
-        start = (crop_size - cube_size) // 2 - reform_ins.edge_depth
-        end = start + cube_size + 2 * reform_ins.edge_depth
-        data = reform_ins.pad_and_crop()        
-        tmp_data_path = f"{output_dir}/tmp.npy"
-        outData = self.predict(data, tmp_data_path=tmp_data_path, F_mask=F_mask,
-                               idx=idx, output_crop=(start, end))
-        outData = outData.squeeze()
-        outData=reform_ins.restore(outData, already_cropped=True)
-        return outData
+        tiles = FileTiles(path, cube_size, crop_size, 5)
+        start = (crop_size - cube_size) // 2 - tiles.edge_depth
+        end = start + cube_size + 2 * tiles.edge_depth
+        devices = [torch.device("cuda", rank) for rank in range(self.world_size)]
+        return predict_tiles(self.model, tiles, prepare, F_mask, (start, end), devices, idx)
     
 
 class DuoNet:
@@ -311,7 +310,7 @@ class DuoNet:
             training_params2["starting_epoch"]+=T_max
 
 
-    def predict_map(self, data, output_dir, cube_size = 64, crop_size=96, F_mask=None):
-        predicted_map1 = self.net1.predict_map(data=data, output_dir=output_dir, cube_size = cube_size, crop_size=crop_size, F_mask=F_mask)
-        predicted_map2 = self.net2.predict_map(data=data, output_dir=output_dir, cube_size = cube_size, crop_size=crop_size, F_mask=F_mask)
+    def predict_map(self, path, output_dir, cube_size = 64, crop_size=96, F_mask=None, prepare=None):
+        predicted_map1 = self.net1.predict_map(path=path, output_dir=output_dir, cube_size = cube_size, crop_size=crop_size, F_mask=F_mask, prepare=prepare)
+        predicted_map2 = self.net2.predict_map(path=path, output_dir=output_dir, cube_size = cube_size, crop_size=crop_size, F_mask=F_mask, prepare=prepare)
         return [predicted_map1, predicted_map2]

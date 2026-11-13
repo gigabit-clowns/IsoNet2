@@ -412,6 +412,49 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
         dist.destroy_process_group()
 
 
+def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None):
+    """Predict the tiles of a tomogram as ddp_predict predicts its crops, reading them
+    from its file through vitrio a few ahead, and blend the predictions back.
+
+    The tiles are spread over `devices` a round at a time, one tile each, on a copy of
+    the model each, and blended in the order they are cut, as reform3D.restore blends
+    them. `prepare` makes the input of the network out of the voxels of a batch of
+    crops, as the tomogram was normalized as a whole.
+    """
+    import copy
+    from itertools import islice
+    import vitrio as vio
+
+    models = [model.to(devices[0]).eval()]
+    models += [copy.deepcopy(models[0]).to(device) for device in devices[1:]]
+    filters = [
+        torch.from_numpy(F_mask[np.newaxis, np.newaxis, :, :, :]).to(device)
+        if F_mask is not None else None
+        for device in devices
+    ]
+    start, end = output_crop
+    blender = tiles.blender()
+    batches = enumerate(vio.data.DataLoader(tiles.dataset(), 1, prefetch=2 * len(devices)))
+    desc = f'Predicting Tomogram{f" {idx}" if idx is not None else ""}: '
+    with torch.no_grad(), tqdm(total=len(tiles), desc=desc) as progress:
+        while True:
+            round_ = list(zip(islice(batches, len(devices)), devices, models, filters))
+            if not round_:
+                break
+            predicted = []
+            for (tile, batch), device, replica, F_m in round_:
+                crops = prepare(tiles.crops(batch))[:, np.newaxis].astype(np.float32)
+                batch_input = torch.from_numpy(crops).to(device)
+                if F_m is not None:
+                    batch_input = apply_F_filter_torch(batch_input, F_m)
+                batch_output = replica(batch_input)
+                predicted.append((tile, batch_output[:, :, start:end, start:end, start:end]))
+            for tile, batch_output in predicted:
+                blender.add(tile, batch_output.cpu()[0, 0].numpy())
+            progress.update(len(predicted))
+    return blender.result()
+
+
 def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mask,idx=None, output_crop=None):
 
     os.environ["MASTER_ADDR"] = "localhost"
