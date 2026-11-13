@@ -436,7 +436,9 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
 
 def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None):
     """Predict the tiles of a tomogram as ddp_predict predicts its crops, reading them
-    from its file through vitrio a few ahead, and blend the predictions back.
+    from its file through vitrio a row along x at a time, the next rows while one is
+    predicted, and blend the predictions back. The tiles of a row lie on the same rows
+    of the file, so a row of them is read as one stretch of each section they span.
 
     The tiles are spread over `devices` a round at a time, one tile each, on a copy of
     the model each, and blended in the order they are cut, as reform3D.restore blends
@@ -456,7 +458,15 @@ def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None)
     ]
     start, end = output_crop
     blender = tiles.blender()
-    batches = enumerate(vio.data.DataLoader(tiles.dataset(), 1, prefetch=2 * len(devices)))
+
+    def inputs():
+        rows = vio.data.DataLoader(tiles.dataset(), tiles.row_length, prefetch=2)
+        for row, batch in enumerate(rows):
+            crops = prepare(tiles.crops(batch))[:, np.newaxis].astype(np.float32)
+            for offset in range(len(crops)):
+                yield row * tiles.row_length + offset, crops[offset:offset + 1]
+
+    batches = inputs()
     desc = f'Predicting Tomogram{f" {idx}" if idx is not None else ""}: '
     with torch.no_grad(), tqdm(total=len(tiles), desc=desc) as progress:
         while True:
@@ -464,9 +474,8 @@ def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None)
             if not round_:
                 break
             predicted = []
-            for (tile, batch), device, replica, F_m in round_:
-                crops = prepare(tiles.crops(batch))[:, np.newaxis].astype(np.float32)
-                batch_input = torch.from_numpy(crops).to(device)
+            for (tile, crop), device, replica, F_m in round_:
+                batch_input = torch.from_numpy(crop).to(device)
                 if F_m is not None:
                     batch_input = apply_F_filter_torch(batch_input, F_m)
                 batch_output = replica(batch_input)

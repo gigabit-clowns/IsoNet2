@@ -192,6 +192,11 @@ class FileTiles:
     def __len__(self):
         return int(np.prod(self._sidelen))
 
+    @property
+    def row_length(self):
+        """How many tiles a row of them along x holds, one after another in `dataset`."""
+        return int(self._sidelen[2])
+
     def _grid(self):
         return np.unravel_index(np.arange(len(self)), tuple(self._sidelen))
 
