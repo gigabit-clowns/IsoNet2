@@ -444,6 +444,10 @@ def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None)
     the model each, and blended in the order they are cut, as reform3D.restore blends
     them. `prepare` makes the input of the network out of the voxels of a batch of
     crops, as the tomogram was normalized as a whole.
+
+    Yields the predicted map a stretch of sections along z at a time, as the index of
+    the first of them and their values, as soon as no later tile reaches them, so
+    the map need never be held whole.
     """
     import copy
     from itertools import islice
@@ -460,30 +464,39 @@ def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None)
     blender = tiles.blender()
 
     def inputs():
-        rows = vio.data.DataLoader(tiles.dataset(), tiles.row_length, prefetch=2)
+        # The rows arrive on the first device, where their crops are cut and
+        # normalized, so the host only reads while the devices compute.
+        rows = vio.data.DataLoader(
+            tiles.dataset(), tiles.row_length, prefetch=2,
+            output="torch", device=devices[0], pin_memory=devices[0].type == "cuda",
+        )
         for row, batch in enumerate(rows):
-            crops = prepare(tiles.crops(batch))[:, np.newaxis].astype(np.float32)
+            crops = prepare(tiles.crops(batch))[:, None]
             for offset in range(len(crops)):
                 yield row * tiles.row_length + offset, crops[offset:offset + 1]
 
     batches = inputs()
     desc = f'Predicting Tomogram{f" {idx}" if idx is not None else ""}: '
-    with torch.no_grad(), tqdm(total=len(tiles), desc=desc) as progress:
+    with tqdm(total=len(tiles), desc=desc) as progress:
         while True:
             round_ = list(zip(islice(batches, len(devices)), devices, models, filters))
             if not round_:
                 break
             predicted = []
-            for (tile, crop), device, replica, F_m in round_:
-                batch_input = torch.from_numpy(crop).to(device)
-                if F_m is not None:
-                    batch_input = apply_F_filter_torch(batch_input, F_m)
-                batch_output = replica(batch_input)
-                predicted.append((tile, batch_output[:, :, start:end, start:end, start:end]))
+            # not around the yields below, which hand control to the caller
+            with torch.no_grad():
+                for (tile, crop), device, replica, F_m in round_:
+                    batch_input = crop.to(device)
+                    if F_m is not None:
+                        batch_input = apply_F_filter_torch(batch_input, F_m)
+                    batch_output = replica(batch_input)
+                    predicted.append((tile, batch_output[:, :, start:end, start:end, start:end]))
             for tile, batch_output in predicted:
-                blender.add(tile, batch_output.cpu()[0, 0].numpy())
+                sections = blender.add(tile, batch_output.cpu()[0, 0].numpy())
+                if sections is not None:
+                    yield sections
             progress.update(len(predicted))
-    return blender.result()
+    blender.check_complete()
 
 
 def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mask,idx=None, output_crop=None):

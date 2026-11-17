@@ -7,7 +7,8 @@ from fire import core
 import starfile
 import mrcfile
 import numpy as np
-from IsoNet.utils.fileio import read_mrc, write_mrc, create_folder
+import vitrio as vio
+from IsoNet.utils.fileio import read_mrc, write_mrc, write_mrc_sections, create_folder
 from IsoNet.utils.utils import parse_params, process_gpuID
 import tqdm
 import pandas as pd
@@ -445,12 +446,15 @@ class ISONET:
             base = os.path.splitext(os.path.basename(tomo_paths[0]))[0]
             prefix = f"{output_dir}/{output_prefix}_{network.method}_{network.arch}_{base}"
             
-            out_data = []
+            # Each tomogram is read for what normalizes it, and then a tile at a time,
+            # each normalized as the whole would have been. Its map comes a stretch of
+            # sections at a time, and the maps of the tomograms are averaged and
+            # written a stretch at a time, while the next is predicted.
+            maps = []
+            shapes = set()
             for tomo_p in tomo_paths:
-                # The tomogram is read whole for what normalizes it, and then a tile at
-                # a time, each normalized as the whole would have been.
                 prepare = tomogram_normalization(tomo_p, network.method)
-                out_data.append(network.predict_map(
+                maps.append(network.predict_map(
                     tomo_p, output_dir,
                     cube_size= int(cube_size / padding_factor+0.1),
                     crop_size=cube_size,
@@ -458,11 +462,20 @@ class ISONET:
                     idx=i + 1,
                     prepare=prepare,
                 ))
+                shapes.add(tuple(vio.query_descriptor(tomo_p).extents))
+            if len(shapes) != 1:
+                raise ValueError(f"The tomograms {tomo_paths} are of different shapes {shapes}.")
 
-            out_data = sum(out_data) / len(out_data)
+            def averaged():
+                for stretches in zip(*maps):
+                    firsts = {first for first, _ in stretches}
+                    assert len(firsts) == 1, firsts
+                    # as the whole maps were: their sum over their count, inverted
+                    out_data = sum(values for _, values in stretches) / len(stretches)
+                    yield firsts.pop(), out_data.astype(np.float32) * -1
 
             out_file = f"{prefix}.mrc"
-            write_mrc(out_file, out_data.astype(np.float32) * -1, voxel_size=float(row.rlnPixelSize))
+            write_mrc_sections(out_file, shapes.pop(), averaged(), voxel_size=float(row.rlnPixelSize))
             all_tomo_paths.append(out_file)
 
 

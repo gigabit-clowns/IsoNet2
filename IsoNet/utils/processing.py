@@ -32,15 +32,48 @@ def tomogram_normalization(path, method, pmin=5.0, pmax=95.0, eps=1e-20):
         mi = np.percentile(inverted, pmin, axis=None, keepdims=True)
         ma = np.percentile(inverted, pmax, axis=None, keepdims=True)
         del inverted
-        scale = ma - mi + eps
-        return lambda voxels: ((voxels * -1 - mi) / scale).astype(np.float32)
+        return InvertedNormalization(mi, ma - mi + eps)
 
     tomo, _ = read_mrc(path, inplace=True)
     Z = tomo.shape[0]
     central = tomo[Z//2-30:Z//2+30] * -1
     mean, std = np.mean(central), np.std(central)
     del central, tomo
-    return lambda voxels: (voxels * -1 - mean) / std
+    return InvertedNormalization(mean, std)
+
+
+class InvertedNormalization:
+    """Voxels made the input of a network as a tomogram is normalized whole: inverted,
+    less an offset, over a scale, in the precision numpy computes that in for voxels
+    of their type and the values of the offset and the scale, given in single
+    precision.
+
+    Applies to a tensor, on its device, divided by a tensor of the scale and not a
+    number, which torch would multiply by its reciprocal instead."""
+
+    def __init__(self, offset, scale):
+        self.offset = np.asarray(offset)
+        self.scale = np.asarray(scale)
+        self._on = {}
+
+    def _values(self, device, precision):
+        if (device, precision) not in self._on:
+            import torch
+            self._on[device, precision] = tuple(
+                torch.from_numpy(value.astype(precision)).to(device)
+                for value in (self.offset, self.scale)
+            )
+        return self._on[device, precision]
+
+    def __call__(self, voxels):
+        import torch
+
+        voxel_type = torch.empty(0, dtype=voxels.dtype).numpy().dtype
+        offset, scale = self._values(
+            voxels.device, np.result_type(voxel_type, self.offset.dtype, self.scale.dtype)
+        )
+        inverted = (voxels * -1).to(offset.dtype)
+        return ((inverted - offset) / scale).to(torch.float32)
 
 
 def crop_to_size(array, crop_size, cube_size):

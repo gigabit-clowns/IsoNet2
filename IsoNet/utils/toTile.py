@@ -217,38 +217,70 @@ class FileTiles:
         })
 
     def crops(self, batch):
-        """The crops of a batch of rows of `dataset`, padding included."""
-        rows = np.arange(len(batch["window"]))[:, None, None, None]
+        """The crops of a batch of rows of `dataset`, padding included, as arrays or
+        as tensors on the device of the batch, whichever the batch is of."""
+        window = batch["window"]
+        if isinstance(window, np.ndarray):
+            rows = np.arange(len(window))[:, None, None, None]
+        else:
+            import torch
+            rows = torch.arange(len(window), device=window.device)[:, None, None, None]
         z = batch["z"][:, :, None, None]
         y = batch["y"][:, None, :, None]
         x = batch["x"][:, None, None, :]
-        return batch["window"][rows, z, y, x]
+        return window[rows, z, y, x]
 
     def blender(self):
-        """Where predicted cubes are blended back, as reform3D.restore blends them."""
+        """Where predicted cubes are blended back, as reform3D.restore blends them, a
+        layer of tiles along z at a time."""
         return _Blender(self)
 
 
 class _Blender:
+    """Blends the predicted cubes of the tiles back as reform3D.restore does, holding
+    only the layer of tiles along z under way and the edge it shares with the next.
+
+    The cubes have to come in the order the tiles are cut. Once a layer is complete,
+    no later cube reaches the sections before the next layer starts, and those
+    sections of the result are handed out; each voxel sums the same terms in the same
+    order as in the whole restored volume.
+    """
+
     def __init__(self, tiles):
+        c, e = tiles.cubesize, tiles.edge_depth
         self.tiles = tiles
-        self.restored = np.zeros(
-            tuple(tiles._sidelen * tiles.cubesize + tiles.edge_depth * 2), dtype=np.float32
-        )
         self.added = 0
+        self._per_layer = int(np.prod(tiles._sidelen[1:]))
+        self._layer = np.zeros((c + e * 2, *(tiles._sidelen[1:] * c + e * 2)), dtype=np.float32)
 
     def add(self, tile, cube):
-        """Add the cropped prediction of tile number `tile` where it lies."""
+        """Add the cropped prediction of tile number `tile` where it lies. Returns the
+        sections of the result the tile completes, as the index of the first of them
+        and their values, or None."""
         c, e = self.tiles.cubesize, self.tiles.edge_depth
         i, j, k = np.unravel_index(tile, tuple(self.tiles._sidelen))
-        self.restored[i*c:(i+1)*c+e*2, j*c:(j+1)*c+e*2, k*c:(k+1)*c+e*2] += cube * self.tiles._masks
+        if tile != self.added:
+            raise ValueError(f"tile {tile} of {self.tiles.path} came after {self.added - 1}.")
+        self._layer[:, j*c:(j+1)*c+e*2, k*c:(k+1)*c+e*2] += cube * self.tiles._masks
         self.added += 1
+        if self.added % self._per_layer:
+            return None
 
-    def result(self):
+        # The layer starts at section i*c of the restored volume; the result starts
+        # at section p of it.
+        last = i == self.tiles._sidelen[0] - 1
+        done = len(self._layer) if last else c
+        p, shape = e * 2, self.tiles.shape
+        first, end = max(i * c, p), min(i * c + done, p + shape[0])
+        sections = self._layer[first - i*c:end - i*c, p:p+shape[1], p:p+shape[2]].copy()
+        if not last:
+            following = np.zeros_like(self._layer)
+            following[:e * 2] = self._layer[c:]
+            self._layer = following
+        return (first - p, sections) if end > first else None
+
+    def check_complete(self):
         if self.added != len(self.tiles):
             raise RuntimeError(
                 f"{self.added} of the {len(self.tiles)} tiles of {self.tiles.path} were blended."
             )
-        p = self.tiles.edge_depth * 2
-        sp = self.tiles.shape
-        return self.restored[p:p+sp[0], p:p+sp[1], p:p+sp[2]]

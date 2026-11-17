@@ -253,9 +253,12 @@ class Net:
     
     def predict_map(self, path, output_dir, cube_size = 64, crop_size=96, F_mask=None, idx=None, prepare=None):
         """Predict the tomogram in the file at `path`, a tile at a time, never holding
-        more of it than the tiles under way and the map they are blended into.
-        `prepare` makes the input of the network out of the voxels of a batch of crops,
-        elementwise, as the tomogram is normalized."""
+        more of it than the tiles under way and the layer of the map they are blended
+        into. `prepare` makes the input of the network out of the voxels of a batch of
+        crops, elementwise, as the tomogram is normalized.
+
+        Yields the map a stretch of sections along z at a time, as predict_tiles does:
+        nothing is predicted until the first is asked for."""
         # change edge width from 7 to 5 to reduce computing
         tiles = FileTiles(path, cube_size, crop_size, 5)
         start = (crop_size - cube_size) // 2 - tiles.edge_depth
