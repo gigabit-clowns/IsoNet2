@@ -256,7 +256,7 @@ class _Blender:
     def add(self, tile, cube):
         """Add the cropped prediction of tile number `tile` where it lies. Returns the
         sections of the result the tile completes, as the index of the first of them
-        and their values, or None."""
+        and a view of their values, or None."""
         c, e = self.tiles.cubesize, self.tiles.edge_depth
         i, j, k = np.unravel_index(tile, tuple(self.tiles._sidelen))
         if tile != self.added:
@@ -272,7 +272,8 @@ class _Blender:
         done = len(self._layer) if last else c
         p, shape = e * 2, self.tiles.shape
         first, end = max(i * c, p), min(i * c + done, p + shape[0])
-        sections = self._layer[first - i*c:end - i*c, p:p+shape[1], p:p+shape[2]].copy()
+        # a view: the layer is never written again, the next one is a new array
+        sections = self._layer[first - i*c:end - i*c, p:p+shape[1], p:p+shape[2]]
         if not last:
             following = np.zeros_like(self._layer)
             following[:e * 2] = self._layer[c:]

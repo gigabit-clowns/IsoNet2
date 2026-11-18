@@ -495,6 +495,8 @@ def predict_tiles(model, tiles, prepare, F_mask, output_crop, devices, idx=None)
                 sections = blender.add(tile, batch_output.cpu()[0, 0].numpy())
                 if sections is not None:
                     yield sections
+                    # not held while the next layer is predicted
+                    del sections
             progress.update(len(predicted))
     blender.check_complete()
 

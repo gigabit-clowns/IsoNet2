@@ -466,13 +466,24 @@ class ISONET:
             if len(shapes) != 1:
                 raise ValueError(f"The tomograms {tomo_paths} are of different shapes {shapes}.")
 
-            def averaged():
-                for stretches in zip(*maps):
+            def averaged(sections=8):
+                while True:
+                    stretches = [next(stretch, None) for stretch in maps]
+                    if all(stretch is None for stretch in stretches):
+                        return
+                    if any(stretch is None for stretch in stretches):
+                        raise RuntimeError(f"The maps of {tomo_paths} ended at different sections.")
                     firsts = {first for first, _ in stretches}
                     assert len(firsts) == 1, firsts
-                    # as the whole maps were: their sum over their count, inverted
-                    out_data = sum(values for _, values in stretches) / len(stretches)
-                    yield firsts.pop(), out_data.astype(np.float32) * -1
+                    first, count = firsts.pop(), len(stretches[0][1])
+                    # as the whole maps were: their sum over their count, inverted, a
+                    # few sections at a time to be written while the next are made
+                    for start in range(0, count, sections):
+                        parts = [values[start:start + sections] for _, values in stretches]
+                        out_data = sum(parts) / len(parts)
+                        yield first + start, out_data.astype(np.float32) * -1
+                    # let the stretches go before the next ones are predicted
+                    del stretches, parts
 
             out_file = f"{prefix}.mrc"
             write_mrc_sections(out_file, shapes.pop(), averaged(), voxel_size=float(row.rlnPixelSize))
