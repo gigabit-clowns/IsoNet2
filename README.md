@@ -1,9 +1,13 @@
 > **A showcase of [vitrio](https://github.com/gigabit-clowns/vitrio), not a maintained fork.**
-> This is IsoNet2 at 4ecf60b (2.1.0 and two commits) with its image reading moved onto vitrio, to show what vitrio
+> This is IsoNet2 at 4ecf60b (2.1.0 and two commits) with its image reading and writing moved onto vitrio, to show what vitrio
 > changes for a program people use. It follows no later upstream release and takes
-> no issues: use upstream for anything else. What changed:
+> no issues: use upstream for anything else.
 >
-> - Prediction reads each tile of a tomogram from its file as it is needed and blends it into the map at once, instead of holding the tomogram, a padded copy, every crop and a temporary file of the predictions; the maps are bit-identical with deterministic cuDNN algorithms.
+> Needs vitrio with [#58](https://github.com/gigabit-clowns/vitrio/pull/58), [#59](https://github.com/gigabit-clowns/vitrio/pull/59) and [#60](https://github.com/gigabit-clowns/vitrio/pull/60), not released yet: build vitrio from source with them.
+>
+> What changed:
+>
+> - Prediction reads the tiles of a tomogram a row at a time through `vitrio.data`, cuts and normalizes them on the GPU, and writes the map through vitrio a few sections at a time while the next layer is predicted, instead of holding the tomogram, a padded copy, every crop, a temporary file of the predictions and the whole map; the maps are bit-identical with deterministic cuDNN algorithms.
 > - Training reads its subvolumes through `vitrio.data` and makes each batch on the GPU, with no worker process.
 
 # _IsoNet2_
